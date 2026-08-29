@@ -1,25 +1,20 @@
-"""viserでURDFロボットを表示しつつ、FastAPI経由でクライアントから関節角度を送れるサーバー。
+"""6軸アームをviserで表示しつつ、FastAPI経由で全軸の関節角度をまとめて送れるサーバー。
 
 viserの3Dビューア(デフォルト http://localhost:8080)とは別に、
 関節角度を受け取るHTTP API(デフォルト http://localhost:8000)を同じプロセスで立てる。
-クライアントはこのAPIにPOSTするだけで、ブラウザ上のロボット姿勢をリアルタイムに動かせる。
+6軸分の角度を毎回まとめて送る形のみをサポートする(1軸だけの部分更新はしない)。
 
     python src/003_server_with_api.py
     python src/003_server_with_api.py --urdf assets/arm/arm.urdf --http-port 8000
 
-クライアント側の例:
+API利用例:
     # 関節名と現在の角度を取得
     curl http://localhost:8000/joints
 
-    # 全関節の角度をまとめて送る(順序は /joints の names に合わせる)
+    # 6軸分の角度をまとめて送る(順序は /joints の names に合わせる)
     curl -X POST http://localhost:8000/joints ^
         -H "Content-Type: application/json" ^
         -d "{\"angles\": [0.3, -0.2, 0, 0, 0, 0]}"
-
-    # 1関節だけ送る
-    curl -X POST http://localhost:8000/joints/tool0 ^
-        -H "Content-Type: application/json" ^
-        -d "{\"angle\": 0.5}"
 """
 
 from __future__ import annotations
@@ -33,19 +28,18 @@ import uvicorn
 import viser
 import viser.extras
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 DEFAULT_URDF = ASSETS_DIR / "arm" / "arm.urdf"
 
+# このサーバーは6軸アーム専用。URDFの可動関節数がこれと一致しない場合は起動時に弾く。
+NUM_JOINTS = 6
+
 
 class AnglesRequest(BaseModel):
-    angles: list[float]
-
-
-class AngleRequest(BaseModel):
-    angle: float
+    # 6軸固定なので、常にちょうど6個の角度をまとめて指定する。
+    angles: list[float] = Field(min_length=NUM_JOINTS, max_length=NUM_JOINTS)
 
 
 class JointState:
@@ -58,7 +52,12 @@ class JointState:
     def __init__(self, viser_urdf: viser.extras.ViserUrdf):
         self._viser_urdf = viser_urdf
         self._names = list(viser_urdf.get_actuated_joint_names())
-        self._angles = np.zeros(len(self._names))
+        if len(self._names) != NUM_JOINTS:
+            raise ValueError(
+                f"このサーバーは{NUM_JOINTS}軸のURDF専用です。"
+                f"実際の可動関節数: {len(self._names)} ({self._names})"
+            )
+        self._angles = np.zeros(NUM_JOINTS)
         self._lock = threading.Lock()
         # 初期姿勢(全関節0)を反映しておく。
         viser_urdf.update_cfg(self._angles)
@@ -72,31 +71,13 @@ class JointState:
             return self._angles.tolist()
 
     def set_all(self, angles: list[float]) -> None:
-        if len(angles) != len(self._names):
-            raise ValueError(
-                f"angles の長さが関節数({len(self._names)})と一致しません: {len(angles)}"
-            )
         with self._lock:
             self._angles = np.array(angles, dtype=float)
-            self._viser_urdf.update_cfg(self._angles)
-
-    def set_one(self, name: str, angle: float) -> None:
-        with self._lock:
-            if name not in self._names:
-                raise KeyError(name)
-            self._angles[self._names.index(name)] = angle
             self._viser_urdf.update_cfg(self._angles)
 
 
 def create_app(state: JointState) -> FastAPI:
     app = FastAPI(title="ViserServer joint API")
-    # ブラウザ上の別オリジンJSクライアントなどからも叩けるようにしておく。
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     @app.get("/joints")
     def get_joints() -> dict:
@@ -104,18 +85,7 @@ def create_app(state: JointState) -> FastAPI:
 
     @app.post("/joints")
     def post_joints(req: AnglesRequest) -> dict:
-        try:
-            state.set_all(req.angles)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        return {"names": state.names, "angles": state.get_angles()}
-
-    @app.post("/joints/{name}")
-    def post_joint(name: str, req: AngleRequest) -> dict:
-        try:
-            state.set_one(name, req.angle)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"unknown joint: {name}")
+        state.set_all(req.angles)
         return {"names": state.names, "angles": state.get_angles()}
 
     return app
@@ -140,7 +110,7 @@ def main(urdf_path: Path, viser_port: int, http_port: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else "")
-    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF, help="表示するURDFファイル")
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF, help="表示するURDFファイル(6軸限定)")
     parser.add_argument("--viser-port", type=int, default=8080, help="viser 3DビューアのHTTPポート")
     parser.add_argument("--http-port", type=int, default=8000, help="関節角度APIのHTTPポート")
     return parser.parse_args()
