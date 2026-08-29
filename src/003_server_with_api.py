@@ -21,6 +21,9 @@ API利用例:
     curl -X POST http://localhost:8000/trajectory ^
         -H "Content-Type: application/json" ^
         -d "{\"csv_path\": \"C:/path/to/trajectory.csv\"}"
+
+再生中は、viserの3Dビューア(ブラウザ)右側のGUIパネルに出る"Time (frame)"スライダーで
+現在のフレームを手動シークできる。ドラッグすると自動再生は止まり、その場の姿勢に切り替わる。
 """
 
 from __future__ import annotations
@@ -146,6 +149,8 @@ class TrajectoryPlayer:
     """時系列角度軌道をバックグラウンドスレッドで再生する。
 
     新しい軌道が来たら、再生中の前の軌道は打ち切って乗り換える。
+    再生中は scrub_slider をフレーム位置に追従させ、ユーザーがスライダーを
+    手動操作したい場合に備えて直近にロードした軌道(times/angles_list)を保持しておく。
     """
 
     def __init__(
@@ -153,19 +158,23 @@ class TrajectoryPlayer:
         arm_urdf: viser.extras.ViserUrdf,
         arm_model: yourdfpy.URDF,
         tool_frame: viser.FrameHandle,
+        scrub_slider: viser.GuiSliderHandle,
     ) -> None:
         self._arm_urdf = arm_urdf
         self._arm_model = arm_model
         self._tool_frame = tool_frame
+        self._scrub_slider = scrub_slider
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
+        self.times: list[float] = []
+        self.angles_list: list[list[float]] = []
 
     def play(self, times: list[float], angles_list: list[list[float]]) -> None:
-        # 前の再生が動いていれば止めてから新しい軌道を始める。
-        if self._stop_event is not None:
-            self._stop_event.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        self.stop()
+        self.times = times
+        self.angles_list = angles_list
+        self._scrub_slider.max = len(times) - 1
+        self._scrub_slider.disabled = False
 
         stop_event = threading.Event()
         self._stop_event = stop_event
@@ -174,10 +183,17 @@ class TrajectoryPlayer:
         )
         self._thread.start()
 
+    def stop(self) -> None:
+        """再生中なら打ち切る(手動シークに切り替えるときにも呼ばれる)。"""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
     def _run(self, times: list[float], angles_list: list[list[float]], stop_event: threading.Event) -> None:
         start_wall = time.monotonic()
         start_t = times[0]
-        for t, angles in zip(times, angles_list):
+        for i, (t, angles) in enumerate(zip(times, angles_list)):
             if stop_event.is_set():
                 return
             wait_sec = (t - start_t) - (time.monotonic() - start_wall)
@@ -186,19 +202,24 @@ class TrajectoryPlayer:
             self._arm_urdf.update_cfg(np.array(angles, dtype=float))
             # 腕が動くとハンドの取り付け位置(手先姿勢)も変わるので追従させる。
             sync_tool_frame(self._arm_model, self._tool_frame)
+            # サーバー側からの代入なので on_update 側では event.client is None になり、
+            # 「ユーザーがドラッグした」ケースと区別できる。
+            self._scrub_slider.value = i
 
 
 def create_app(
     arm_urdf: viser.extras.ViserUrdf,
     arm_model: yourdfpy.URDF,
     tool_frame: viser.FrameHandle,
+    scrub_slider: viser.GuiSliderHandle,
 ) -> FastAPI:
     """角度を受け取ってviserの表示姿勢に反映するだけのFastAPIアプリを作る。
 
     取得(GET)や現在角度の保持は行わない、送りっぱなしのSET専用API。
+    ロード済みの軌道は scrub_slider を動かすことでも手動シークできる。
     """
     app = FastAPI(title="ViserServer joint API")
-    player = TrajectoryPlayer(arm_urdf, arm_model, tool_frame)
+    player = TrajectoryPlayer(arm_urdf, arm_model, tool_frame, scrub_slider)
 
     @app.post("/joints")
     def post_joints(req: AnglesRequest) -> dict:
@@ -220,6 +241,21 @@ def create_app(
         player.play(times, angles_list)
         return {"ok": True, "num_points": len(times), "duration_sec": times[-1] - times[0]}
 
+    @scrub_slider.on_update
+    def _(event: viser.GuiEvent) -> None:
+        # event.client は、ユーザーがブラウザで直接スライダーを操作したときだけ非Noneになる。
+        # (TrajectoryPlayerがサーバー側から scrub_slider.value = i とセットする更新では None。)
+        # これでプレイヤー自身による追従更新と、手動ドラッグを区別する。
+        if event.client is None:
+            return
+        if not player.angles_list:
+            return
+        player.stop()  # 手動操作されたので自動再生は打ち切る。
+        idx = int(scrub_slider.value)
+        if 0 <= idx < len(player.angles_list):
+            arm_urdf.update_cfg(np.array(player.angles_list[idx], dtype=float))
+            sync_tool_frame(arm_model, tool_frame)
+
     return app
 
 
@@ -240,11 +276,17 @@ def main(
             f"実際の可動関節数: {len(joint_names)} ({joint_names})"
         )
 
+    # 軌道再生位置を手動シークするためのスライダー。軌道が一度もロードされるまでは無効化しておく。
+    # 値は生の秒数ではなくフレームインデックス(0..len(times)-1)。
+    scrub_slider = server.gui.add_slider(
+        "Time (frame)", min=0, max=0, step=1, initial_value=0, disabled=True
+    )
+
     print(f"Open your browser to http://localhost:{viser_port}")
     print(f"Joint API listening on http://localhost:{http_port} (POST /joints, POST /trajectory)")
     print("Press Ctrl+C to exit")
 
-    app = create_app(arm_urdf, arm_model, tool_frame)
+    app = create_app(arm_urdf, arm_model, tool_frame, scrub_slider)
     # viserは内部で自前のサーバースレッドを立てて非同期に動くので、
     # ここでuvicornをフォアグラウンドで走らせてプロセスを維持する。
     uvicorn.run(app, host="0.0.0.0", port=http_port, log_level="info")
