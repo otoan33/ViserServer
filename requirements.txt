@@ -1,0 +1,7 @@
+pandas
+numpy
+scipy
+# viser 0.2.x と 1.x では ViserUrdf のシーンノード命名規則が異なるため固定する
+viser==1.1.0
+yourdfpy
+robot_descriptions

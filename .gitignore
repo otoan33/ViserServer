@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# 3Dモデル・URDF一式（リポジトリには含めず各自で配置する）
+assets/
