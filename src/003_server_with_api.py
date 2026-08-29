@@ -24,7 +24,8 @@ API利用例:
 
 再生中は、viserの3Dビューア(ブラウザ)右側のGUIパネルに出る"Time (frame)"スライダーで
 現在のフレームを手動シークできる。ドラッグすると自動再生は止まり、その場の姿勢に切り替わる。
-同じパネルの"Stop"ボタンでも、その場の姿勢のまま自動再生を打ち切れる。
+同じパネルの再生/停止ボタンは、停止中は"Play"(現在のスライダー位置から再開)、
+再生中は"Stop"(その場の姿勢で打ち切り)とラベルが切り替わるトグル式。
 """
 
 from __future__ import annotations
@@ -152,6 +153,7 @@ class TrajectoryPlayer:
     新しい軌道が来たら、再生中の前の軌道は打ち切って乗り換える。
     再生中は scrub_slider をフレーム位置に追従させ、ユーザーがスライダーを
     手動操作したい場合に備えて直近にロードした軌道(times/angles_list)を保持しておく。
+    再生状態は play_stop_button のラベル("Play"/"Stop")として表示する。
     """
 
     def __init__(
@@ -160,38 +162,55 @@ class TrajectoryPlayer:
         arm_model: yourdfpy.URDF,
         tool_frame: viser.FrameHandle,
         scrub_slider: viser.GuiSliderHandle,
+        play_stop_button: viser.GuiButtonHandle,
     ) -> None:
         self._arm_urdf = arm_urdf
         self._arm_model = arm_model
         self._tool_frame = tool_frame
         self._scrub_slider = scrub_slider
+        self._play_stop_button = play_stop_button
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
         self.times: list[float] = []
         self.angles_list: list[list[float]] = []
 
-    def play(self, times: list[float], angles_list: list[list[float]]) -> None:
-        self.stop()
+    def play(self, times: list[float], angles_list: list[list[float]], start_index: int = 0) -> None:
+        """start_index フレーム目から末尾まで再生する(既定は先頭から)。"""
+        self._cancel_current()
         self.times = times
         self.angles_list = angles_list
         self._scrub_slider.max = len(times) - 1
         self._scrub_slider.disabled = False
+        self._play_stop_button.disabled = False
+        self._play_stop_button.label = "Stop"
 
+        sub_times = times[start_index:]
+        sub_angles = angles_list[start_index:]
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._thread = threading.Thread(
-            target=self._run, args=(times, angles_list, stop_event), daemon=True
+            target=self._run, args=(sub_times, sub_angles, start_index, stop_event), daemon=True
         )
         self._thread.start()
 
     def stop(self) -> None:
-        """再生中なら打ち切る(手動シークに切り替えるときにも呼ばれる)。"""
+        """再生中なら打ち切り、その場の姿勢で止める(ボタンは"Play"に戻す)。"""
+        self._cancel_current()
+        self._play_stop_button.label = "Play"
+
+    def _cancel_current(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
-    def _run(self, times: list[float], angles_list: list[list[float]], stop_event: threading.Event) -> None:
+    def _run(
+        self,
+        times: list[float],
+        angles_list: list[list[float]],
+        index_offset: int,
+        stop_event: threading.Event,
+    ) -> None:
         start_wall = time.monotonic()
         start_t = times[0]
         for i, (t, angles) in enumerate(zip(times, angles_list)):
@@ -205,7 +224,9 @@ class TrajectoryPlayer:
             sync_tool_frame(self._arm_model, self._tool_frame)
             # サーバー側からの代入なので on_update 側では event.client is None になり、
             # 「ユーザーがドラッグした」ケースと区別できる。
-            self._scrub_slider.value = i
+            self._scrub_slider.value = index_offset + i
+        # 打ち切られずに最後まで再生し終えた場合は、ボタンを"Play"に戻す。
+        self._play_stop_button.label = "Play"
 
 
 def create_app(
@@ -213,7 +234,7 @@ def create_app(
     arm_model: yourdfpy.URDF,
     tool_frame: viser.FrameHandle,
     scrub_slider: viser.GuiSliderHandle,
-    stop_button: viser.GuiButtonHandle,
+    play_stop_button: viser.GuiButtonHandle,
 ) -> FastAPI:
     """角度を受け取ってviserの表示姿勢に反映するだけのFastAPIアプリを作る。
 
@@ -221,12 +242,21 @@ def create_app(
     ロード済みの軌道は scrub_slider を動かすことでも手動シークできる。
     """
     app = FastAPI(title="ViserServer joint API")
-    player = TrajectoryPlayer(arm_urdf, arm_model, tool_frame, scrub_slider)
+    player = TrajectoryPlayer(arm_urdf, arm_model, tool_frame, scrub_slider, play_stop_button)
 
-    @stop_button.on_click
+    @play_stop_button.on_click
     def _(_event: viser.GuiEvent) -> None:
-        # 再生中の軌道があれば打ち切る。その場の姿勢のまま止まる(リセットはしない)。
-        player.stop()
+        # ラベルで現在の状態を判定し、停止中なら再生・再生中なら停止するトグル動作。
+        if play_stop_button.label == "Stop":
+            player.stop()
+            return
+        if not player.angles_list:
+            return
+        # 末尾まで再生し終えていたら最初から、それ以外は今のスライダー位置から再開する。
+        start_index = int(scrub_slider.value)
+        if start_index >= len(player.times) - 1:
+            start_index = 0
+        player.play(player.times, player.angles_list, start_index=start_index)
 
     @app.post("/joints")
     def post_joints(req: AnglesRequest) -> dict:
@@ -288,14 +318,15 @@ def main(
     scrub_slider = server.gui.add_slider(
         "Time (frame)", min=0, max=0, step=1, initial_value=0, disabled=True
     )
-    # 自動再生を任意のタイミングで打ち切るためのボタン(その場の姿勢で止まる)。
-    stop_button = server.gui.add_button("Stop")
+    # 再生/停止トグルボタン。停止中は"Play"、再生中は"Stop"とラベルが切り替わる。
+    # 軌道が一度もロードされるまでは押しても何もないので無効化しておく。
+    play_stop_button = server.gui.add_button("Play", disabled=True)
 
     print(f"Open your browser to http://localhost:{viser_port}")
     print(f"Joint API listening on http://localhost:{http_port} (POST /joints, POST /trajectory)")
     print("Press Ctrl+C to exit")
 
-    app = create_app(arm_urdf, arm_model, tool_frame, scrub_slider, stop_button)
+    app = create_app(arm_urdf, arm_model, tool_frame, scrub_slider, play_stop_button)
     # viserは内部で自前のサーバースレッドを立てて非同期に動くので、
     # ここでuvicornをフォアグラウンドで走らせてプロセスを維持する。
     uvicorn.run(app, host="0.0.0.0", port=http_port, log_level="info")
