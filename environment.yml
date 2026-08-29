@@ -15,3 +15,4 @@ dependencies:
       - yourdfpy
       - robot_descriptions
       - fastapi
+      - uvicorn
