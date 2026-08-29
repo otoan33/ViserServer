@@ -5,3 +5,4 @@ scipy
 viser==1.1.0
 yourdfpy
 robot_descriptions
+fastapi

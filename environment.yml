@@ -14,3 +14,4 @@ dependencies:
       # URDFの順運動学を直接叩くため（viserの推移的依存に頼らず明示する）
       - yourdfpy
       - robot_descriptions
+      - fastapi
