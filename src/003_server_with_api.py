@@ -24,6 +24,7 @@ API利用例:
 
 再生中は、viserの3Dビューア(ブラウザ)右側のGUIパネルに出る"Time (frame)"スライダーで
 現在のフレームを手動シークできる。ドラッグすると自動再生は止まり、その場の姿勢に切り替わる。
+同じパネルの"Stop"ボタンでも、その場の姿勢のまま自動再生を打ち切れる。
 """
 
 from __future__ import annotations
@@ -212,6 +213,7 @@ def create_app(
     arm_model: yourdfpy.URDF,
     tool_frame: viser.FrameHandle,
     scrub_slider: viser.GuiSliderHandle,
+    stop_button: viser.GuiButtonHandle,
 ) -> FastAPI:
     """角度を受け取ってviserの表示姿勢に反映するだけのFastAPIアプリを作る。
 
@@ -220,6 +222,11 @@ def create_app(
     """
     app = FastAPI(title="ViserServer joint API")
     player = TrajectoryPlayer(arm_urdf, arm_model, tool_frame, scrub_slider)
+
+    @stop_button.on_click
+    def _(_event: viser.GuiEvent) -> None:
+        # 再生中の軌道があれば打ち切る。その場の姿勢のまま止まる(リセットはしない)。
+        player.stop()
 
     @app.post("/joints")
     def post_joints(req: AnglesRequest) -> dict:
@@ -281,12 +288,14 @@ def main(
     scrub_slider = server.gui.add_slider(
         "Time (frame)", min=0, max=0, step=1, initial_value=0, disabled=True
     )
+    # 自動再生を任意のタイミングで打ち切るためのボタン(その場の姿勢で止まる)。
+    stop_button = server.gui.add_button("Stop")
 
     print(f"Open your browser to http://localhost:{viser_port}")
     print(f"Joint API listening on http://localhost:{http_port} (POST /joints, POST /trajectory)")
     print("Press Ctrl+C to exit")
 
-    app = create_app(arm_urdf, arm_model, tool_frame, scrub_slider)
+    app = create_app(arm_urdf, arm_model, tool_frame, scrub_slider, stop_button)
     # viserは内部で自前のサーバースレッドを立てて非同期に動くので、
     # ここでuvicornをフォアグラウンドで走らせてプロセスを維持する。
     uvicorn.run(app, host="0.0.0.0", port=http_port, log_level="info")
