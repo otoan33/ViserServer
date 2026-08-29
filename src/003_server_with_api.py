@@ -1,14 +1,18 @@
-"""6軸アームをviserで表示しつつ、FastAPI経由で全軸の関節角度をまとめて送れるサーバー。
+"""6軸アーム+ハンドをviserで表示しつつ、FastAPI経由で全軸の関節角度をまとめて送れるサーバー。
+
+アームとハンドの合成方法は 002_arm_with_hand.py と同じで、アーム手先リンク(既定 tool0)に
+中継フレームを立ててハンドをぶら下げる。腕の関節角度が変わるたびに、その中継フレームの姿勢も
+FKで計算し直してハンドを追従させる。
 
 viserの3Dビューア(デフォルト http://localhost:8080)とは別に、
 関節角度を受け取るHTTP API(デフォルト http://localhost:8000)を同じプロセスで立てる。
 6軸分の角度を毎回まとめて送る形のみをサポートする(1軸だけの部分更新や、現在角度の取得はしない)。
 
     python src/003_server_with_api.py
-    python src/003_server_with_api.py --urdf assets/arm/arm.urdf --http-port 8000
+    python src/003_server_with_api.py --arm assets/arm/arm.urdf --hand assets/hand/hand_jig.urdf --http-port 8000
 
 API利用例:
-    # 6軸分の角度をまとめて送る(順序はURDFの可動関節の定義順)
+    # 6軸分の角度をまとめて送る(順序はアームURDFの可動関節の定義順)
     curl -X POST http://localhost:8000/joints ^
         -H "Content-Type: application/json" ^
         -d "{\"angles\": [0.3, -0.2, 0, 0, 0, 0]}"
@@ -17,17 +21,25 @@ API利用例:
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import uvicorn
 import viser
 import viser.extras
+import viser.transforms as vtf
+import yourdfpy
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
-DEFAULT_URDF = ASSETS_DIR / "arm" / "arm.urdf"
+DEFAULT_ARM_URDF = ASSETS_DIR / "arm" / "arm.urdf"
+DEFAULT_HAND_URDF = ASSETS_DIR / "hand" / "hand_jig.urdf"
+
+# ハンドを取り付けるアーム側リンク名と、ハンドを吊るすシーンノード名。
+DEFAULT_MOUNT_LINK = "tool0"
+MOUNT_NODE_NAME = "/tool_mount"
 
 # このサーバーは6軸アーム専用。URDFの可動関節数がこれと一致しない場合は起動時に弾く。
 NUM_JOINTS = 6
@@ -38,7 +50,59 @@ class AnglesRequest(BaseModel):
     angles: list[float] = Field(min_length=NUM_JOINTS, max_length=NUM_JOINTS)
 
 
-def create_app(viser_urdf: viser.extras.ViserUrdf) -> FastAPI:
+def load_urdf(path: Path) -> yourdfpy.URDF:
+    """メッシュの相対パスをURDFのある位置から解決して読み込む。"""
+    return yourdfpy.URDF.load(
+        str(path),
+        filename_handler=partial(yourdfpy.filename_handler_magic, dir=str(path.parent)),
+    )
+
+
+def add_arm_with_hand(
+    server: viser.ViserServer,
+    arm_urdf_path: Path,
+    hand_urdf_path: Path,
+    mount_link: str = DEFAULT_MOUNT_LINK,
+    mount_node_name: str = MOUNT_NODE_NAME,
+) -> tuple[viser.extras.ViserUrdf, yourdfpy.URDF, viser.FrameHandle]:
+    """アームとハンドのURDFを読み込み、ハンドをアーム手先に取り付けてシーンに追加する。
+
+    Returns:
+        (アームのViserUrdf, アームのyourdfpyモデル, ハンドを吊るす中継フレーム)。
+    """
+    # 順運動学を自前で参照したいので yourdfpy のモデルを保持しておく
+    # (ViserUrdf.update_cfg はこのオブジェクトをそのまま更新してくれる)。
+    arm_model = load_urdf(arm_urdf_path)
+    arm_urdf = viser.extras.ViserUrdf(server, urdf_or_path=arm_model)
+
+    # ハンドは別URDFなので中継フレームを親にしてぶら下げる。
+    tool_frame = server.scene.add_frame(mount_node_name, show_axes=False)
+    hand_urdf = viser.extras.ViserUrdf(
+        server, urdf_or_path=load_urdf(hand_urdf_path), root_node_name=mount_node_name
+    )
+    # ハンド側に可動関節はない想定だが、固定ジョイントの姿勢を一度反映しておく。
+    hand_urdf.update_cfg(np.zeros(len(hand_urdf.get_actuated_joint_names())))
+
+    # 全関節0の姿勢で表示し、中継フレームをそのときの手先姿勢に合わせる。
+    arm_urdf.update_cfg(np.zeros(len(arm_urdf.get_actuated_joint_names())))
+    sync_tool_frame(arm_model, tool_frame, mount_link)
+
+    return arm_urdf, arm_model, tool_frame
+
+
+def sync_tool_frame(arm_model: yourdfpy.URDF, tool_frame: viser.FrameHandle, mount_link: str) -> None:
+    """アームの現在姿勢(FK)に合わせて、ハンドを吊るす中継フレームを追従させる。"""
+    T_world_mount = arm_model.get_transform(mount_link)
+    tool_frame.wxyz = vtf.SO3.from_matrix(T_world_mount[:3, :3]).wxyz
+    tool_frame.position = T_world_mount[:3, 3]
+
+
+def create_app(
+    arm_urdf: viser.extras.ViserUrdf,
+    arm_model: yourdfpy.URDF,
+    tool_frame: viser.FrameHandle,
+    mount_link: str,
+) -> FastAPI:
     """角度を受け取ってviserの表示姿勢に反映するだけのFastAPIアプリを作る。
 
     取得(GET)や現在角度の保持は行わない、送りっぱなしのSET専用API。
@@ -47,31 +111,39 @@ def create_app(viser_urdf: viser.extras.ViserUrdf) -> FastAPI:
 
     @app.post("/joints")
     def post_joints(req: AnglesRequest) -> dict:
-        viser_urdf.update_cfg(np.array(req.angles, dtype=float))
+        arm_urdf.update_cfg(np.array(req.angles, dtype=float))
+        # 腕が動くとハンドの取り付け位置(手先姿勢)も変わるので追従させる。
+        sync_tool_frame(arm_model, tool_frame, mount_link)
         return {"ok": True}
 
     return app
 
 
-def main(urdf_path: Path, viser_port: int, http_port: int) -> None:
+def main(
+    arm_urdf_path: Path,
+    hand_urdf_path: Path,
+    mount_link: str,
+    viser_port: int,
+    http_port: int,
+) -> None:
     server = viser.ViserServer(port=viser_port)
     server.scene.add_grid("/grid", width=2.0, height=2.0)
 
-    viser_urdf = viser.extras.ViserUrdf(server, urdf_or_path=urdf_path)
-    joint_names = viser_urdf.get_actuated_joint_names()
+    arm_urdf, arm_model, tool_frame = add_arm_with_hand(
+        server, arm_urdf_path, hand_urdf_path, mount_link=mount_link
+    )
+    joint_names = arm_urdf.get_actuated_joint_names()
     if len(joint_names) != NUM_JOINTS:
         raise ValueError(
             f"このサーバーは{NUM_JOINTS}軸のURDF専用です。"
             f"実際の可動関節数: {len(joint_names)} ({joint_names})"
         )
-    # 初期姿勢(全関節0)を反映しておく。
-    viser_urdf.update_cfg(np.zeros(NUM_JOINTS))
 
     print(f"Open your browser to http://localhost:{viser_port}")
     print(f"Joint API listening on http://localhost:{http_port} (POST /joints)")
     print("Press Ctrl+C to exit")
 
-    app = create_app(viser_urdf)
+    app = create_app(arm_urdf, arm_model, tool_frame, mount_link)
     # viserは内部で自前のサーバースレッドを立てて非同期に動くので、
     # ここでuvicornをフォアグラウンドで走らせてプロセスを維持する。
     uvicorn.run(app, host="0.0.0.0", port=http_port, log_level="info")
@@ -79,7 +151,11 @@ def main(urdf_path: Path, viser_port: int, http_port: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else "")
-    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF, help="表示するURDFファイル(6軸限定)")
+    parser.add_argument("--arm", type=Path, default=DEFAULT_ARM_URDF, help="アームのURDFファイル(6軸限定)")
+    parser.add_argument("--hand", type=Path, default=DEFAULT_HAND_URDF, help="ハンドのURDFファイル")
+    parser.add_argument(
+        "--mount-link", default=DEFAULT_MOUNT_LINK, help="ハンドを取り付けるアーム側のリンク名"
+    )
     parser.add_argument("--viser-port", type=int, default=8080, help="viser 3DビューアのHTTPポート")
     parser.add_argument("--http-port", type=int, default=8000, help="関節角度APIのHTTPポート")
     return parser.parse_args()
@@ -87,4 +163,10 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args.urdf, viser_port=args.viser_port, http_port=args.http_port)
+    main(
+        args.arm,
+        args.hand,
+        mount_link=args.mount_link,
+        viser_port=args.viser_port,
+        http_port=args.http_port,
+    )
